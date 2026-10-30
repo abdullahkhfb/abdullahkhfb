@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="602" height="310" viewBox="0 0 602 310" role="img" aria-label="coffee-cup">
+  <defs>
+    <filter id="glow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="4" result="blur"/>
+      <feFlood flood-color="#e24a6c" flood-opacity=".75"/>
+      <feComposite in2="blur" operator="in" result="halo"/>
+      <feMerge><feMergeNode in="halo"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <path id="cup-body" d="M0 16 L6 82 C8 100 24 110 50 110 C76 110 92 100 94 82 L100 16 Z"/>
+    <path id="cup-rim" d="M0 16a50 13 0 1 0 100 0a50 13 0 1 0 -100 0Z"/>
+    <path id="cup-coffee" d="M7 16a43 8.5 0 1 0 86 0a43 8.5 0 1 0 -86 0Z"/>
+    <path id="cup-handle" d="M97 30 C130 26 140 42 135 60 C130 78 112 86 89 82 L90 71 C106 73 120 67 123 57 C126 47 119 41 98 43 Z"/>
+    <path id="cup-saucer" d="M-12 112a62 7 0 1 0 124 0a62 7 0 1 0 -124 0Z"/>
+    <path id="github-logo-shape" d="M8 0c4.42 0 8 3.58 8 8a8.013 8.013 0 0 1-5.45 7.59c-.4.08-.55-.17-.55-.38 0-.27.01-1.13.01-2.2 0-.75-.25-1.23-.54-1.48 1.78-.2 3.65-.88 3.65-3.95 0-.88-.31-1.59-.82-2.15.08-.2.36-1.02-.08-2.12 0 0-.67-.22-2.2.82-.64-.18-1.32-.27-2-.27-.68 0-1.36.09-2 .27-1.53-1.03-2.2-.82-2.2-.82-.44 1.1-.16 1.92-.08 2.12 -.51.56-.82 1.28-.82 2.15 0 3.06 1.86 3.75 3.64 3.95-.23.2-.44.55-.51 1.07-.46.21-1.61.55-2.33-.66 -.15-.24-.6-.83-1.23-.82-.67.01-.27.38.01.53.34.19.73.9.82 1.13.16.45.68 1.31 2.69.94 0 .67.01 1.3.01 1.49 0 .21-.15.45-.55.38A7.995 7.995 0 0 1 0 8c0-4.42 3.58-8 8-8Z"/>
+  </defs>
+  <g id="artwork" transform="translate(45.15 23.25) scale(0.85)">
+    <g id="coffee-cup-glow" filter="url(#glow)">
+      <g transform="translate(29.0 198.6) scale(0.92)" fill="#b63952" stroke="#b63952" stroke-width="12.0" stroke-linejoin="round"><use href="#cup-body"/><use href="#cup-rim"/><use href="#cup-handle"/><use href="#cup-saucer"/></g>
+    </g>
+    <g id="coffee-cup" transform="translate(29.0 198.6) scale(0.92)">
+      <g id="cup-shell" fill="#fff"><use href="#cup-body"/><use href="#cup-rim"/><use href="#cup-handle"/><use href="#cup-saucer"/></g>
+      <use id="cup-coffee-surface" href="#cup-coffee" fill="#b63952"/>
+      <use id="cup-logo" href="#github-logo-shape" transform="translate(17.0 31.0) scale(4.12500)" fill="#b63952"/>
+    </g>
+  </g>
+</svg>
