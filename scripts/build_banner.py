@@ -9,6 +9,10 @@ Everything is vector: lettering is converted to outlines from Black Chancery
 and the coffee-cup is drawn as paths, so nothing is raster and nothing is cropped
 at any zoom level.
 
+Besides the static banner (assets/banner-static.svg) it writes assets/banner.svg, a
+looping "handwriting" version: every character is revealed left to right by its own
+soft-edged mask (pure SVG/SMIL, no scripts, so it also plays inside a GitHub <img>).
+
 Usage: python3 scripts/build_banner.py
 """
 import os
@@ -19,6 +23,7 @@ from fontTools.pens.transformPen import TransformPen
 from fontTools.ttLib import TTFont
 
 OUT = 'assets/banner.svg'
+OUT_STATIC = 'assets/banner-static.svg'
 COMP_DIR = 'assets/components'
 LATIN_FONT = 'BLKCHCRY.TTF'
 CRIMSON = '#b63952'
@@ -40,6 +45,24 @@ def outline(font, text, size, x, y, tracking=0.0):
         glyphs[name].draw(TransformPen(bounds, (scale, 0, 0, -scale, cursor, y)))
         cursor += glyphs[name].width * scale + tracking
     return pen.getCommands(), bounds.bounds, cursor
+
+
+def outline_chars(font, text, size, x, y, tracking=0.0):
+    """Same geometry as outline(), but one entry per character: path + bounding box."""
+    glyphs = font.getGlyphSet()
+    cmap = font.getBestCmap()
+    scale = size / font['head'].unitsPerEm
+    chars, cursor = [], x
+    for char in text:
+        name = cmap[ord(char)]
+        pen = SVGPathPen(glyphs, ntos=lambda v: f'{v:.2f}')
+        bounds = BoundsPen(glyphs)
+        t = (scale, 0, 0, -scale, cursor, y)
+        glyphs[name].draw(TransformPen(pen, t))
+        glyphs[name].draw(TransformPen(bounds, t))
+        chars.append({'d': pen.getCommands(), 'box': bounds.bounds})
+        cursor += glyphs[name].width * scale + tracking
+    return chars
 
 
 # GitHub mark (Octicons "mark-github", 16x16 box): a disc with the cat cut out.
@@ -134,6 +157,170 @@ def document(parts, comps, title, inset=True):
             f'  <defs>\n    {FILTER}{defs}\n  </defs>\n{body}</svg>\n')
 
 
+# ---------------------------------------------------------------- animation ----
+SOFT = 16        # px width of the feathered leading edge of the "pen"
+PAD = 10         # reveal margin around a glyph so its stroke + glow are never cut
+REACH = 700      # length of the reveal bar (must exceed the widest glyph + SOFT)
+MARGIN = 80      # masks reach this far past the canvas so nothing at the edges is clipped
+SPEED = 360      # px of lettering written per second
+BASE = 0.12      # extra seconds per glyph so narrow letters don't flash in
+OVERLAP = 0.08   # next glyph / part starts this long before the previous one ends
+WORD_PAUSE = 0.12
+LEAD_IN = 0.25   # blank time at the start of every loop
+HOLD = 2.8       # finished banner stays on screen
+FADE = 0.9       # fade-out before the loop restarts
+GAP = 0.45       # blank time after the fade
+EASE = '.45 .05 .55 .95'
+LINEAR = '0 0 1 1'
+
+# The cup is drawn part by part, top to bottom, like a pen sketching it:
+# (id, kind, path, seconds).  'shell' = white body parts with a glowing outline,
+# 'ink' = crimson details drawn on top of the white.
+CUP_SEQ = [
+    ('rim', 'shell', CUP_RIM, 0.45),
+    ('body', 'shell', CUP_BODY, 0.75),
+    ('handle', 'shell', CUP_HANDLE, 0.5),
+    ('saucer', 'shell', CUP_SAUCER, 0.5),
+    ('coffee', 'ink', CUP_COFFEE, 0.4),
+    ('logo', 'logo', MARK_SHAPE, 0.6),
+]
+TRACE_W = 3.0    # px width of the white pen line while a part is being traced
+
+
+def fmt(v):
+    return f'{v:.5f}'.rstrip('0').rstrip('.')
+
+
+def smooth(p):
+    p = min(1.0, max(0.0, p))
+    return p * p * (3 - 2 * p)
+
+
+def track(attr, pts, total, freeze):
+    """Animate one attribute along pts = [(seconds, value), ...] (ascending), looping every `total`
+    seconds. Returns (static_attr, animate_xml): the static attribute holds the *finished* value, so
+    renderers without SMIL show the completed banner. With freeze=t it returns that instant instead."""
+    if freeze is not None:
+        v = pts[0][1] if freeze <= pts[0][0] else pts[-1][1]
+        for (t0, v0), (t1, v1) in zip(pts, pts[1:]):
+            if t0 <= freeze <= t1:
+                v = v0 + (v1 - v0) * smooth((freeze - t0) / (t1 - t0))
+                break
+        return f'{attr}="{fmt(v)}"', ''
+    keys = [0.0] + [t / total for t, _ in pts] + [1.0]
+    vals = [pts[0][1]] + [v for _, v in pts] + [pts[-1][1]]
+    splines = [LINEAR if vals[i] == vals[i + 1] else EASE for i in range(len(vals) - 1)]
+    xml = (f'<animate attributeName="{attr}" dur="{total:.2f}s" repeatCount="indefinite" '
+           f'calcMode="spline" keyTimes="{";".join(fmt(k) for k in keys)}" '
+           f'values="{";".join(fmt(v) for v in vals)}" keySplines="{";".join(splines)}"/>')
+    return f'{attr}="{fmt(pts[-1][1])}"', xml
+
+
+def build_items():
+    """Writing order: The, Programmer, coffee cup (part by part), Diaries."""
+    latin = TTFont(LATIN_FONT)
+    words = {
+        'the': outline_chars(latin, 'The', 66, 24, 51),
+        'programmer': outline_chars(latin, 'Programmer', 108, CODING_X, 156, 0),
+        'diaries': outline_chars(latin, 'Diaries', 138, 168, 295, 0),
+    }
+    items, cup, t = [], [], LEAD_IN
+    for name in ('the', 'programmer', 'cup', 'diaries'):
+        if name == 'cup':
+            for pid, kind, d, dur in CUP_SEQ:
+                cup.append({'id': pid, 'kind': kind, 'd': d, 'start': t, 'dur': dur})
+                t += dur - OVERLAP
+            t += OVERLAP + WORD_PAUSE
+            continue
+        for i, ch in enumerate(words[name]):
+            x0, _, x1, _ = ch['box']
+            dur = BASE + (x1 - x0) / SPEED
+            items.append({'id': f'{name}-{i}', 'd': ch['d'], 'box': ch['box'],
+                          'start': t, 'dur': dur,
+                          'hide': x0 - PAD - REACH,             # bar fully left of the glyph
+                          'show': x1 + PAD - REACH + SOFT})     # solid part of the bar past the glyph
+            t += dur - OVERLAP
+        t += WORD_PAUSE
+    write_end = max(i['start'] + i['dur'] for i in items + cup)
+    return items, cup, write_end + HOLD + FADE + GAP
+
+
+def mask_xml(it, total, freeze):
+    if freeze is None:
+        a, b = it['start'] / total, (it['start'] + it['dur']) / total
+        anim = (f'<animateTransform attributeName="transform" type="translate" dur="{total:.2f}s" '
+                f'repeatCount="indefinite" calcMode="spline" '
+                f'keyTimes="0;{fmt(a)};{fmt(b)};1" '
+                f'values="{it["hide"]:.1f} 0;{it["hide"]:.1f} 0;{it["show"]:.1f} 0;{it["show"]:.1f} 0" '
+                f'keySplines="{LINEAR};{EASE};{LINEAR}"/>')
+        tx = it['show']          # without SMIL support the text simply shows, fully written
+    else:
+        p = smooth((freeze - it['start']) / it['dur'])
+        anim, tx = '', it['hide'] + (it['show'] - it['hide']) * p
+    return (f'<mask id="m-{it["id"]}" maskUnits="userSpaceOnUse" x="{-MARGIN}" y="{-MARGIN}" '
+            f'width="{W + 2 * MARGIN}" height="{H + 2 * MARGIN}">'
+            f'<rect y="{-MARGIN}" width="{REACH}" height="{H + 2 * MARGIN}" fill="url(#edge)" '
+            f'transform="translate({tx:.1f} 0)">{anim}</rect></mask>')
+
+
+def cup_xml(cup, total, freeze):
+    """Glow layer + white/ink layer of the cup, each part animated on its own."""
+    glow_w = 11 / CUP_SCALE
+    glow, body = [], []
+    for part in cup:
+        t0, t1 = part['start'], part['start'] + part['dur']
+        dash_attr, dash_anim = track('stroke-dashoffset', [(t0, 1), (t1, 0)], total, freeze)
+        common = f'd="{part["d"]}" pathLength="1" stroke-dasharray="1 2" stroke-linejoin="round" '
+        if part['kind'] == 'shell':
+            # the glowing outline is traced by the pen...
+            glow.append(f'<path {common}fill="none" {dash_attr}>{dash_anim}</path>')
+            # ...with a thin white core line, then the white fills in and the core line fades away
+            fill_attr, fill_anim = track('fill-opacity', [(t1 - 0.15, 0), (t1 + 0.25, 1)], total, freeze)
+            ln_attr, ln_anim = track('stroke-opacity', [(t1 - 0.05, 1), (t1 + 0.3, 0)], total, freeze)
+            body.append(f'<path {common}fill="#fff" stroke="#fff" stroke-width="{TRACE_W / CUP_SCALE:.2f}" '
+                        f'{dash_attr} {fill_attr} {ln_attr}>{dash_anim}{fill_anim}{ln_anim}</path>')
+        else:
+            fill_attr, fill_anim = track('fill-opacity', [(t1 - 0.12, 0), (t1 + 0.2, 1)], total, freeze)
+            ln_attr, ln_anim = track('stroke-opacity', [(t1 - 0.05, 1), (t1 + 0.25, 0)], total, freeze)
+            width, extra = (2.4, '') if part['kind'] == 'ink' else (0.6, f' transform="{LOGO_TRANSFORM}"')
+            body.append(f'<path {common}fill="{CRIMSON}" stroke="{CRIMSON}" stroke-width="{width}"{extra} '
+                        f'{dash_attr} {fill_attr} {ln_attr}>{dash_anim}{fill_anim}{ln_anim}</path>')
+    return (f'<g id="coffee-cup-glow" filter="url(#glow)"><g transform="{CUP_TRANSFORM}" fill="none" '
+            f'stroke="{CRIMSON}" stroke-width="{glow_w:.1f}" stroke-linejoin="round">{"".join(glow)}</g></g>\n'
+            f'    <g id="coffee-cup" transform="{CUP_TRANSFORM}">{"".join(body)}</g>')
+
+
+def animated_document(items, cup, total, freeze=None):
+    defs = ''.join(f'\n    <path id="g-{i["id"]}" d="{i["d"]}"/>' for i in items)
+    defs += (f'\n    <linearGradient id="edge" gradientUnits="userSpaceOnUse" '
+             f'x1="{REACH - SOFT}" y1="0" x2="{REACH}" y2="0">'
+             f'<stop offset="0" stop-color="#fff"/><stop offset="1" stop-color="#fff" stop-opacity="0"/>'
+             f'</linearGradient>')
+    defs += ''.join('\n    ' + mask_xml(i, total, freeze) for i in items)
+
+    glow = ''.join(f'<g mask="url(#m-{i["id"]})"><use href="#g-{i["id"]}"/></g>' for i in items)
+    layers = (
+        f'<g id="glow" filter="url(#glow)">'
+        f'<g fill="{CRIMSON}" stroke="{CRIMSON}" stroke-width="11" stroke-linejoin="round">{glow}</g></g>\n'
+        f'    <g id="fill" fill="#fff" stroke="#fff" stroke-width="2.6" stroke-linejoin="round">{glow}</g>\n'
+        f'    {cup_xml(cup, total, freeze)}')
+
+    write_end = max(i['start'] + i['dur'] for i in items + cup)
+    if freeze is None:
+        fade_attr = ''
+        _, fade_anim = track('opacity', [(write_end + HOLD, 1), (total - GAP, 0)], total, None)
+    else:
+        op = 1 - smooth((freeze - (write_end + HOLD)) / FADE)
+        fade_attr, fade_anim = f' opacity="{op:.3f}"', ''
+    t = f'translate({W * (1 - INSET) / 2:.2f} {H * (1 - INSET) / 2:.2f}) scale({INSET})'
+    return (f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" '
+            f'viewBox="0 0 {W} {H}" role="img" aria-label="The Programmer Diaries">\n'
+            f'  <defs>\n    {FILTER}{defs}\n  </defs>\n'
+            f'  <g id="artwork" transform="{t}">\n'
+            f'   <g id="write-loop"{fade_attr}>{fade_anim}\n    {layers}\n   </g>\n'
+            f'  </g>\n</svg>\n')
+
+
 def main():
     comps = build_components()
     os.makedirs(COMP_DIR, exist_ok=True)
@@ -142,9 +329,13 @@ def main():
     for name in ('the', 'programmer', 'diaries', 'coffee-cup'):
         with open(f'{COMP_DIR}/{name}.svg', 'w') as f:
             f.write(document([name], comps, name))
-    svg = document(['the', 'programmer', 'diaries', 'coffee-cup'], comps, 'The Programmer Diaries')
+    static = document(['the', 'programmer', 'diaries', 'coffee-cup'], comps, 'The Programmer Diaries')
+    open(OUT_STATIC, 'w').write(static)
+    items, cup, total = build_items()
+    svg = animated_document(items, cup, total)
     open(OUT, 'w').write(svg)
-    print(len(svg) // 1024, 'KB')
+    print(f'static {len(static) // 1024} KB, animated {len(svg) // 1024} KB, loop {total:.1f}s')
 
 
-main()
+if __name__ == '__main__':
+    main()
