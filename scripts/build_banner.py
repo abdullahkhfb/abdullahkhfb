@@ -167,9 +167,9 @@ BASE = 0.12      # extra seconds per glyph so narrow letters don't flash in
 OVERLAP = 0.08   # next glyph / part starts this long before the previous one ends
 WORD_PAUSE = 0.12
 LEAD_IN = 0.25   # blank time at the start of every loop
-HOLD = 2.8       # finished banner stays on screen
-FADE = 0.9       # fade-out before the loop restarts
-GAP = 0.45       # blank time after the fade
+HOLD = 2.0       # finished banner stays on screen before it un-writes
+GAP = 0.2        # blank time after un-writing, before the next pass
+MIRROR_AT = 0.0  # set by build_items(): time t on the way in <-> MIRROR_AT - t on the way out
 EASE = '.45 .05 .55 .95'
 LINEAR = '0 0 1 1'
 
@@ -196,23 +196,37 @@ def smooth(p):
     return p * p * (3 - 2 * p)
 
 
+def sample(pts, t):
+    """Value of a (seconds, value) track at time t, eased between points, held outside them."""
+    if t <= pts[0][0]:
+        return pts[0][1]
+    for (t0, v0), (t1, v1) in zip(pts, pts[1:]):
+        if t0 <= t <= t1:
+            return v0 + (v1 - v0) * smooth((t - t0) / (t1 - t0))
+    return pts[-1][1]
+
+
+def pingpong(pts):
+    """Forward points followed by the same points played backwards (pen retracing its path)."""
+    return pts + [(MIRROR_AT - t, v) for t, v in reversed(pts)]
+
+
+def splines_for(vals):
+    return ';'.join(LINEAR if vals[i] == vals[i + 1] else EASE for i in range(len(vals) - 1))
+
+
 def track(attr, pts, total, freeze):
-    """Animate one attribute along pts = [(seconds, value), ...] (ascending), looping every `total`
-    seconds. Returns (static_attr, animate_xml): the static attribute holds the *finished* value, so
-    renderers without SMIL show the completed banner. With freeze=t it returns that instant instead."""
+    """Animate one attribute: along pts = [(seconds, value), ...] and then back again, looping every
+    `total` seconds. Returns (static_attr, animate_xml); the static attribute holds the *finished*
+    value so renderers without SMIL show the completed banner. freeze=t returns that instant."""
+    full = pingpong(pts)
     if freeze is not None:
-        v = pts[0][1] if freeze <= pts[0][0] else pts[-1][1]
-        for (t0, v0), (t1, v1) in zip(pts, pts[1:]):
-            if t0 <= freeze <= t1:
-                v = v0 + (v1 - v0) * smooth((freeze - t0) / (t1 - t0))
-                break
-        return f'{attr}="{fmt(v)}"', ''
-    keys = [0.0] + [t / total for t, _ in pts] + [1.0]
-    vals = [pts[0][1]] + [v for _, v in pts] + [pts[-1][1]]
-    splines = [LINEAR if vals[i] == vals[i + 1] else EASE for i in range(len(vals) - 1)]
+        return f'{attr}="{fmt(sample(full, freeze))}"', ''
+    keys = [0.0] + [t / total for t, _ in full] + [1.0]
+    vals = [full[0][1]] + [v for _, v in full] + [full[-1][1]]
     xml = (f'<animate attributeName="{attr}" dur="{total:.2f}s" repeatCount="indefinite" '
            f'calcMode="spline" keyTimes="{";".join(fmt(k) for k in keys)}" '
-           f'values="{";".join(fmt(v) for v in vals)}" keySplines="{";".join(splines)}"/>')
+           f'values="{";".join(fmt(v) for v in vals)}" keySplines="{splines_for(vals)}"/>')
     return f'{attr}="{fmt(pts[-1][1])}"', xml
 
 
@@ -241,22 +255,24 @@ def build_items():
                           'show': x1 + PAD - REACH + SOFT})     # solid part of the bar past the glyph
             t += dur - OVERLAP
         t += WORD_PAUSE
-    write_end = max(i['start'] + i['dur'] for i in items + cup)
-    return items, cup, write_end + HOLD + FADE + GAP
+    global MIRROR_AT
+    written = max(i['start'] + i['dur'] for i in items + cup) + 0.35   # +0.35: last fills settle
+    MIRROR_AT = 2 * written + HOLD
+    return items, cup, MIRROR_AT + GAP
 
 
 def mask_xml(it, total, freeze):
+    pts = [(it['start'], it['hide']), (it['start'] + it['dur'], it['show'])]
+    full = pingpong(pts)
     if freeze is None:
-        a, b = it['start'] / total, (it['start'] + it['dur']) / total
+        keys = [0.0] + [t / total for t, _ in full] + [1.0]
+        xs = [full[0][1]] + [v for _, v in full] + [full[-1][1]]
         anim = (f'<animateTransform attributeName="transform" type="translate" dur="{total:.2f}s" '
-                f'repeatCount="indefinite" calcMode="spline" '
-                f'keyTimes="0;{fmt(a)};{fmt(b)};1" '
-                f'values="{it["hide"]:.1f} 0;{it["hide"]:.1f} 0;{it["show"]:.1f} 0;{it["show"]:.1f} 0" '
-                f'keySplines="{LINEAR};{EASE};{LINEAR}"/>')
+                f'repeatCount="indefinite" calcMode="spline" keyTimes="{";".join(fmt(k) for k in keys)}" '
+                f'values="{";".join(f"{x:.1f} 0" for x in xs)}" keySplines="{splines_for(xs)}"/>')
         tx = it['show']          # without SMIL support the text simply shows, fully written
     else:
-        p = smooth((freeze - it['start']) / it['dur'])
-        anim, tx = '', it['hide'] + (it['show'] - it['hide']) * p
+        anim, tx = '', sample(full, freeze)
     return (f'<mask id="m-{it["id"]}" maskUnits="userSpaceOnUse" x="{-MARGIN}" y="{-MARGIN}" '
             f'width="{W + 2 * MARGIN}" height="{H + 2 * MARGIN}">'
             f'<rect y="{-MARGIN}" width="{REACH}" height="{H + 2 * MARGIN}" fill="url(#edge)" '
@@ -305,19 +321,12 @@ def animated_document(items, cup, total, freeze=None):
         f'    <g id="fill" fill="#fff" stroke="#fff" stroke-width="2.6" stroke-linejoin="round">{glow}</g>\n'
         f'    {cup_xml(cup, total, freeze)}')
 
-    write_end = max(i['start'] + i['dur'] for i in items + cup)
-    if freeze is None:
-        fade_attr = ''
-        _, fade_anim = track('opacity', [(write_end + HOLD, 1), (total - GAP, 0)], total, None)
-    else:
-        op = 1 - smooth((freeze - (write_end + HOLD)) / FADE)
-        fade_attr, fade_anim = f' opacity="{op:.3f}"', ''
     t = f'translate({W * (1 - INSET) / 2:.2f} {H * (1 - INSET) / 2:.2f}) scale({INSET})'
     return (f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" '
             f'viewBox="0 0 {W} {H}" role="img" aria-label="The Programmer Diaries">\n'
             f'  <defs>\n    {FILTER}{defs}\n  </defs>\n'
             f'  <g id="artwork" transform="{t}">\n'
-            f'   <g id="write-loop"{fade_attr}>{fade_anim}\n    {layers}\n   </g>\n'
+            f'   <g id="write-loop">\n    {layers}\n   </g>\n'
             f'  </g>\n</svg>\n')
 
 
