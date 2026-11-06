@@ -10,11 +10,14 @@ and the coffee-cup is drawn as paths, so nothing is raster and nothing is croppe
 at any zoom level.
 
 Besides the static banner (assets/banner-static.svg) it writes assets/banner.svg, a
-looping "handwriting" version: every character is revealed left to right by its own
-soft-edged mask (pure SVG/SMIL, no scripts, so it also plays inside a GitHub <img>).
+looping "handwriting" version: every letter is written by a pen that follows the strokes a hand
+would make (assets/source/pen_paths.json, computed by scripts/trace_pen_paths.py), then un-written
+in reverse (pure SVG/SMIL, no scripts, so it also plays inside a GitHub <img>).
 
 Usage: python3 scripts/build_banner.py
 """
+import json
+import math
 import os
 
 from fontTools.pens.boundsPen import BoundsPen
@@ -158,18 +161,33 @@ def document(parts, comps, title, inset=True):
 
 
 # ---------------------------------------------------------------- animation ----
-SOFT = 16        # px width of the feathered leading edge of the "pen"
-PAD = 10         # reveal margin around a glyph so its stroke + glow are never cut
-REACH = 700      # length of the reveal bar (must exceed the widest glyph + SOFT)
-MARGIN = 80      # masks reach this far past the canvas so nothing at the edges is clipped
-SPEED = 360      # px of lettering written per second
-BASE = 0.12      # extra seconds per glyph so narrow letters don't flash in
-OVERLAP = 0.08   # next glyph / part starts this long before the previous one ends
-WORD_PAUSE = 0.12
-LEAD_IN = 0.25   # blank time at the start of every loop
-HOLD = 2.0       # finished banner stays on screen before it un-writes
-GAP = 0.2        # blank time after un-writing, before the next pass
-MIRROR_AT = 0.0  # set by build_items(): time t on the way in <-> MIRROR_AT - t on the way out
+# Every letter is revealed by a pen: assets/source/pen_paths.json (made by scripts/trace_pen_paths.py)
+# holds, per letter, the strokes a hand would write as points (x, y, r) -- r being the radius of the
+# largest circle that fits inside the letter there -- plus a few "corner patches" for sharp corners
+# the centre line cannot reach. A mask draws each stroke piece by piece with a round nib of that
+# size, so the letter appears exactly where the pen has been, at the pen's own speed.
+PEN_FILE = 'assets/source/pen_paths.json'
+PEN_SPEED = 900      # banner units per second on a straight, open stretch of a stroke
+CURVE_SLOW = 1.1     # extra slow-down in the tightest curves (1 + this at the limit)
+CURVE_REF = 0.16     # curvature (radians per unit) at which that limit is reached
+RAMP = 0.7           # extra slow-down when a stroke starts and when it ends...
+RAMP_LEN = 9.0       # ...over this many units
+LIFT = 0.05          # seconds the pen is off the paper between two strokes
+LETTER_GAP = 0.06    # seconds between two letters
+WORD_PAUSE = 0.14
+CHUNK_LEN = 20.0     # a stroke is revealed in pieces at most this long (units)...
+CHUNK_DR = 1.8       # ...and a piece never spans more than this change in stroke radius
+NIB_GROW = 1.12      # nib radius = inscribed radius * NIB_GROW + NIB_PAD (never leaves a corner bare)
+NIB_PAD = 2.0        # includes the 1.3-unit white outline that sits around each letter
+GLOW_PAD = 7.4       # the crimson outline (5.5 units) + antialiasing: the halo runs just ahead of the pen
+GLOW_CHUNK = 30.0    # the halo's nib can be coarse
+PATCH_TIME = 0.06
+OVERLAP = 0.08       # next cup part starts this long before the previous one ends
+LEAD_IN = 0.25       # blank time at the start of every loop
+HOLD = 2.0           # finished banner stays on screen before it un-writes
+GAP = 0.2            # blank time after un-writing, before the next pass
+MARGIN = 80          # masks reach this far past the canvas so nothing at the edges is clipped
+MIRROR_AT = 0.0      # set by build_items(): time t on the way in <-> MIRROR_AT - t on the way out
 EASE = '.45 .05 .55 .95'
 LINEAR = '0 0 1 1'
 
@@ -188,7 +206,11 @@ TRACE_W = 3.0    # px width of the white pen line while a part is being traced
 
 
 def fmt(v):
-    return f'{v:.5f}'.rstrip('0').rstrip('.')
+    return f'{v:.4f}'.rstrip('0').rstrip('.')
+
+
+def vec(v):
+    return ' '.join(fmt(x) for x in v)
 
 
 def smooth(p):
@@ -197,47 +219,133 @@ def smooth(p):
 
 
 def sample(pts, t):
-    """Value of a (seconds, value) track at time t, eased between points, held outside them."""
+    """Value (a tuple) of a [(seconds, tuple)] track at time t, eased between points, held outside."""
     if t <= pts[0][0]:
         return pts[0][1]
     for (t0, v0), (t1, v1) in zip(pts, pts[1:]):
         if t0 <= t <= t1:
-            return v0 + (v1 - v0) * smooth((t - t0) / (t1 - t0))
+            p = smooth((t - t0) / (t1 - t0))
+            return tuple(a + (b - a) * p for a, b in zip(v0, v1))
     return pts[-1][1]
 
 
-def pingpong(pts):
-    """Forward points followed by the same points played backwards (pen retracing its path)."""
-    return pts + [(MIRROR_AT - t, v) for t, v in reversed(pts)]
+def flip(spline):
+    """The easing curve of a segment played backwards (so the way out is an exact mirror)."""
+    x1, y1, x2, y2 = (float(n) for n in spline.split())
+    return f'{fmt(1 - x2)} {fmt(1 - y2)} {fmt(1 - x1)} {fmt(1 - y1)}'
 
 
-def splines_for(vals):
-    return ';'.join(LINEAR if vals[i] == vals[i + 1] else EASE for i in range(len(vals) - 1))
+def pingpong(pts, ease):
+    """Forward points followed by the same points played backwards, plus a spline for every segment."""
+    full = pts + [(MIRROR_AT - t, v) for t, v in reversed(pts)]
+    forward = [ease if a[1] != b[1] else LINEAR for a, b in zip(pts, pts[1:])]
+    return full, forward + [LINEAR] + [flip(sp) for sp in reversed(forward)]
 
 
-def track(attr, pts, total, freeze):
-    """Animate one attribute: along pts = [(seconds, value), ...] and then back again, looping every
-    `total` seconds. Returns (static_attr, animate_xml); the static attribute holds the *finished*
-    value so renderers without SMIL show the completed banner. freeze=t returns that instant."""
-    full = pingpong(pts)
+def anim_track(attr, pts, total, freeze, ease=EASE, kind=None):
+    """Animate one attribute (or, with kind, a transform of that type) along pts = [(seconds, tuple)]
+    and then back again, looping every `total` seconds. Returns (value_string, animate_xml); the value
+    is the *finished* state, so renderers without SMIL show the completed banner. freeze=t returns
+    the value at that instant instead and no animation."""
+    full, segs = pingpong(pts, ease)
     if freeze is not None:
-        return f'{attr}="{fmt(sample(full, freeze))}"', ''
+        return vec(sample(full, freeze)), ''
     keys = [0.0] + [t / total for t, _ in full] + [1.0]
     vals = [full[0][1]] + [v for _, v in full] + [full[-1][1]]
-    xml = (f'<animate attributeName="{attr}" dur="{total:.2f}s" repeatCount="indefinite" '
+    tag = 'animateTransform' if kind else 'animate'
+    extra = f' type="{kind}"' if kind else ''
+    xml = (f'<{tag} attributeName="{attr}"{extra} dur="{total:.2f}s" repeatCount="indefinite" '
            f'calcMode="spline" keyTimes="{";".join(fmt(k) for k in keys)}" '
-           f'values="{";".join(fmt(v) for v in vals)}" keySplines="{splines_for(vals)}"/>')
-    return f'{attr}="{fmt(pts[-1][1])}"', xml
+           f'values="{";".join(vec(v) for v in vals)}" '
+           f'keySplines="{";".join([LINEAR] + segs + [LINEAR])}"/>')
+    return vec(pts[-1][1]), xml
 
 
-def build_items():
-    """Writing order: The, Programmer, coffee cup (part by part), Diaries."""
+def track(attr, pts, total, freeze, ease=EASE):
+    """Scalar convenience wrapper: returns (static_attribute, animate_xml)."""
+    value, xml = anim_track(attr, [(t, (v,)) for t, v in pts], total, freeze, ease)
+    return f'{attr}="{value}"', xml
+
+
+# ---- the pen --------------------------------------------------------------------------------
+def pen_timing(stroke):
+    """Seconds at which the pen reaches each point of a stroke [(x, y, r), ...].
+
+    The pen's speed follows the shape: it slows in tight curves (the turning angle at every point
+    gives the curvature) and eases in and out at the ends of the stroke."""
+    p = [(x, y) for x, y, _ in stroke]
+    seg = [math.dist(p[i], p[i + 1]) for i in range(len(p) - 1)]
+    heading = [math.atan2(p[i + 1][1] - p[i][1], p[i + 1][0] - p[i][0]) for i in range(len(p) - 1)]
+    kappa = [0.0] * len(p)
+    for i in range(1, len(p) - 1):
+        turn = abs((heading[i] - heading[i - 1] + math.pi) % (2 * math.pi) - math.pi)
+        kappa[i] = turn / max(1e-6, (seg[i - 1] + seg[i]) / 2)
+    total_len = sum(seg)
+    t, run, times = 0.0, 0.0, [0.0]
+    for i, ds in enumerate(seg):
+        k = (kappa[i] + kappa[i + 1]) / 2
+        mid = run + ds / 2
+        slow = 1 + CURVE_SLOW * min(1.0, k / CURVE_REF)
+        slow *= 1 + RAMP * (1 - smooth(mid / RAMP_LEN)) + RAMP * (1 - smooth((total_len - mid) / RAMP_LEN))
+        t += ds * slow / PEN_SPEED
+        run += ds
+        times.append(t)
+    return times
+
+
+def make_chunks(stroke, times, t, max_len, max_dr, pad, limit_dr=True):
+    """Cut a stroke into pieces, each drawn with one round nib sized for the widest part of it."""
+    chunks, i = [], 0
+    while i < len(stroke) - 1:
+        j, length, lo, hi = i, 0.0, stroke[i][2], stroke[i][2]
+        while j < len(stroke) - 1:
+            nlen = length + math.dist(stroke[j][:2], stroke[j + 1][:2])
+            nlo, nhi = min(lo, stroke[j + 1][2]), max(hi, stroke[j + 1][2])
+            if j > i and (nlen > max_len or (limit_dr and nhi - nlo > max_dr)):
+                break
+            j, length, lo, hi = j + 1, nlen, nlo, nhi
+        d = 'M' + ' L'.join(f'{x:.1f} {y:.1f}' for x, y, _ in stroke[i:j + 1])
+        chunks.append({'d': d, 'w': 2 * (hi * NIB_GROW + pad), 't0': t + times[i], 't1': t + times[j]})
+        i = j
+    return chunks
+
+
+def write_glyph(entry, t0):
+    """Schedule one letter starting at t0. Returns (chunks, glow_chunks, patches, end_time)."""
+    chunks, glow, patches, t, stroke_t0 = [], [], [], t0, []
+    for stroke in entry['strokes']:
+        if len(stroke) < 2:                      # a lone point (a dot): give it a tiny stem to draw along
+            x, y, r = stroke[0]
+            stroke = [[x, y, r], [x + 0.01, y, r]]
+        times = pen_timing(stroke)
+        stroke_t0.append((t, times))
+        chunks += make_chunks(stroke, times, t, CHUNK_LEN, CHUNK_DR, NIB_PAD)
+        glow += make_chunks(stroke, times, t, GLOW_CHUNK, 0, GLOW_PAD, limit_dr=False)
+        t += times[-1] + LIFT
+    for x, y, r, k, i in entry['patches']:
+        ts, times = stroke_t0[k]
+        patches.append({'x': x, 'y': y, 'r': r, 't0': ts + times[i], 't1': ts + times[i] + PATCH_TIME})
+    end = max([c['t1'] for c in chunks] + [q['t1'] for q in patches])
+    return chunks, glow, patches, end
+
+
+def glyph_outlines():
+    """Outlines of every letter of the three words, per character: {'the': [...], ...}."""
     latin = TTFont(LATIN_FONT)
-    words = {
+    return {
         'the': outline_chars(latin, 'The', 66, 24, 51),
         'programmer': outline_chars(latin, 'Programmer', 108, CODING_X, 156, 0),
         'diaries': outline_chars(latin, 'Diaries', 138, 168, 295, 0),
     }
+
+
+def build_items():
+    """Writing order: The, Programmer, coffee cup (part by part), Diaries."""
+    if not os.path.exists(PEN_FILE):
+        raise SystemExit(f'{PEN_FILE} is missing: run  python3 scripts/trace_pen_paths.py  first')
+    with open(PEN_FILE) as f:
+        pen = json.load(f)
+    words = glyph_outlines()
     items, cup, t = [], [], LEAD_IN
     for name in ('the', 'programmer', 'cup', 'diaries'):
         if name == 'cup':
@@ -247,36 +355,35 @@ def build_items():
             t += OVERLAP + WORD_PAUSE
             continue
         for i, ch in enumerate(words[name]):
-            x0, _, x1, _ = ch['box']
-            dur = BASE + (x1 - x0) / SPEED
-            items.append({'id': f'{name}-{i}', 'd': ch['d'], 'box': ch['box'],
-                          'start': t, 'dur': dur,
-                          'hide': x0 - PAD - REACH,             # bar fully left of the glyph
-                          'show': x1 + PAD - REACH + SOFT})     # solid part of the bar past the glyph
-            t += dur - OVERLAP
-        t += WORD_PAUSE
+            chunks, glow, patches, end = write_glyph(pen[name][i], t)
+            items.append({'id': f'{name}-{i}', 'd': ch['d'], 'chunks': chunks, 'glow_chunks': glow,
+                          'patches': patches, 'start': t, 'dur': end - t})
+            t = end + LETTER_GAP
+        t += WORD_PAUSE - LETTER_GAP
     global MIRROR_AT
     written = max(i['start'] + i['dur'] for i in items + cup) + 0.35   # +0.35: last fills settle
     MIRROR_AT = 2 * written + HOLD
     return items, cup, MIRROR_AT + GAP
 
 
-def mask_xml(it, total, freeze):
-    pts = [(it['start'], it['hide']), (it['start'] + it['dur'], it['show'])]
-    full = pingpong(pts)
-    if freeze is None:
-        keys = [0.0] + [t / total for t, _ in full] + [1.0]
-        xs = [full[0][1]] + [v for _, v in full] + [full[-1][1]]
-        anim = (f'<animateTransform attributeName="transform" type="translate" dur="{total:.2f}s" '
-                f'repeatCount="indefinite" calcMode="spline" keyTimes="{";".join(fmt(k) for k in keys)}" '
-                f'values="{";".join(f"{x:.1f} 0" for x in xs)}" keySplines="{splines_for(xs)}"/>')
-        tx = it['show']          # without SMIL support the text simply shows, fully written
-    else:
-        anim, tx = '', sample(full, freeze)
-    return (f'<mask id="m-{it["id"]}" maskUnits="userSpaceOnUse" x="{-MARGIN}" y="{-MARGIN}" '
-            f'width="{W + 2 * MARGIN}" height="{H + 2 * MARGIN}">'
-            f'<rect y="{-MARGIN}" width="{REACH}" height="{H + 2 * MARGIN}" fill="url(#edge)" '
-            f'transform="translate({tx:.1f} 0)">{anim}</rect></mask>')
+def mask_xml(it, total, freeze, glow=False):
+    """A reveal mask of one letter: the nib's path, drawn piece by piece. The tight one (m-) uncovers
+    the white letter exactly; the wider one (mg-) uncovers its crimson outline and glow."""
+    body = []
+    for c in (it['glow_chunks'] if glow else it['chunks']):
+        attr, xml = track('stroke-dashoffset', [(c['t0'], 1), (c['t1'], 0)], total, freeze, LINEAR)
+        body.append(f'<path d="{c["d"]}" pathLength="1" stroke-width="{c["w"]:.1f}" {attr}>{xml}</path>')
+    for q in ([] if glow else it['patches']):
+        attr, xml = track('r', [(q['t0'], 0), (q['t1'], q['r'])], total, freeze, LINEAR)
+        body.append(f'<circle cx="{q["x"]}" cy="{q["y"]}" fill="#fff" stroke="none" {attr}>{xml}</circle>')
+    return (f'<mask id="m{"g" if glow else ""}-{it["id"]}" maskUnits="userSpaceOnUse" x="{-MARGIN}" '
+            f'y="{-MARGIN}" width="{W + 2 * MARGIN}" height="{H + 2 * MARGIN}">'
+            f'<g fill="none" stroke="#fff" stroke-linecap="round" stroke-linejoin="round" '
+            f'stroke-dasharray="1 2">{"".join(body)}</g></mask>')
+
+
+def glyph_xml(it, glow):
+    return f'<g mask="url(#m{"g" if glow else ""}-{it["id"]})"><use href="#g-{it["id"]}"/></g>'
 
 
 def cup_xml(cup, total, freeze):
@@ -308,19 +415,14 @@ def cup_xml(cup, total, freeze):
 
 def animated_document(items, cup, total, freeze=None):
     defs = ''.join(f'\n    <path id="g-{i["id"]}" d="{i["d"]}"/>' for i in items)
-    defs += (f'\n    <linearGradient id="edge" gradientUnits="userSpaceOnUse" '
-             f'x1="{REACH - SOFT}" y1="0" x2="{REACH}" y2="0">'
-             f'<stop offset="0" stop-color="#fff"/><stop offset="1" stop-color="#fff" stop-opacity="0"/>'
-             f'</linearGradient>')
-    defs += ''.join('\n    ' + mask_xml(i, total, freeze) for i in items)
-
-    glow = ''.join(f'<g mask="url(#m-{i["id"]})"><use href="#g-{i["id"]}"/></g>' for i in items)
+    defs += ''.join('\n    ' + mask_xml(i, total, freeze, g) for i in items for g in (True, False))
     layers = (
         f'<g id="glow" filter="url(#glow)">'
-        f'<g fill="{CRIMSON}" stroke="{CRIMSON}" stroke-width="11" stroke-linejoin="round">{glow}</g></g>\n'
-        f'    <g id="fill" fill="#fff" stroke="#fff" stroke-width="2.6" stroke-linejoin="round">{glow}</g>\n'
+        f'<g fill="{CRIMSON}" stroke="{CRIMSON}" stroke-width="11" stroke-linejoin="round">'
+        f'{"".join(glyph_xml(i, True) for i in items)}</g></g>\n'
+        f'    <g id="fill" fill="#fff" stroke="#fff" stroke-width="2.6" stroke-linejoin="round">'
+        f'{"".join(glyph_xml(i, False) for i in items)}</g>\n'
         f'    {cup_xml(cup, total, freeze)}')
-
     t = f'translate({W * (1 - INSET) / 2:.2f} {H * (1 - INSET) / 2:.2f}) scale({INSET})'
     return (f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" '
             f'viewBox="0 0 {W} {H}" role="img" aria-label="The Programmer Diaries">\n'
